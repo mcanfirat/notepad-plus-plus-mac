@@ -96,6 +96,38 @@ static void NPPScheduleTypeTest(void) {
     });
 }
 
+// Debug aid: NPP_QUITTEST=type types into an untitled buffer and quits through -[NSApp terminate:], the real ⌘Q
+// path; NPP_QUITTEST=check relaunches and prints what came back. Snapshot mode is meant to carry unsaved work
+// across a quit with no prompt at all (N++ ships it on), and only the full quit path exercises that — an exit()
+// from a test hook skips applicationWillTerminate, which is where the decision to keep the snapshots is made.
+static void NPPScheduleQuitTest(const char *mode) {
+    BOOL typing = strcmp(mode, "type") == 0;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        NPPEditorWindowController *wc = nil;
+        for (NSWindow *w in NSApp.windows) if ([w.windowController isKindOfClass:NPPEditorWindowController.class]) { wc = (NPPEditorWindowController *)w.windowController; break; }
+        if (!wc) { fprintf(stderr, "QUITTEST: no main window controller\n"); exit(10); }
+        NSMutableArray *titles = [NSMutableArray array];
+        for (NPPTabItem *it in wc.tabBar.items) [titles addObject:[NSString stringWithFormat:@"%@%@", it.dirty ? @"*" : @"", it.title]];
+        if (typing) {
+            NPPDocument *doc = wc.currentDocument;
+            NPPSci(doc.editor, SCI_SETTEXT, 0, (sptr_t)"unsaved work that must survive a quit");
+            fprintf(stderr, "QUITTEST type: tabs before quit = %s\n", [titles componentsJoinedByString:@" | "].UTF8String);
+            // One turn of the run loop so the edit lands, then the real quit.
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(1.5 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                [NSApp terminate:nil];
+            });
+            return;
+        }
+        NPPDocument *doc = wc.currentDocument;
+        long len = doc.editor ? NPPSci(doc.editor, SCI_GETLENGTH) : 0;
+        char buf[256] = {0};
+        if (len > 0 && len < 250) NPPSci(doc.editor, SCI_GETTEXT, (uptr_t)len + 1, (sptr_t)buf);
+        fprintf(stderr, "QUITTEST check: tabs = %s | current len=%ld text=\"%s\"\n",
+                [titles componentsJoinedByString:@" | "].UTF8String, len, buf);
+        exit(0);
+    });
+}
+
 // Debug aid: NPP_EXERCISE=1 drives the running app through menu validation, every language, every theme and a batch of
 // safe editor commands (no dialogs), prints a summary and exits. Exit code = number of failures.
 static void NPPScheduleExercise(void) {
@@ -324,6 +356,7 @@ int main(int argc, const char *argv[]) {
         NPPAppDelegate *delegate = [NPPAppDelegate new];
         app.delegate = delegate;
         if (const char *shot = getenv("NPP_SCREENSHOT")) NPPScheduleScreenshot(shot);
+        if (const char *q = getenv("NPP_QUITTEST")) NPPScheduleQuitTest(q);
         if (getenv("NPP_TYPETEST")) NPPScheduleTypeTest();
         if (getenv("NPP_EXERCISE")) NPPScheduleExercise();
         if (getenv("NPP_EXERCISE_DIALOGS")) NPPScheduleDialogExercise();

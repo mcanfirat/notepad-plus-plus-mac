@@ -6,11 +6,26 @@
 // SNAPSHOTS — every `snapshotInterval` seconds (and on every tab switch, throttled) each dirty buffer is written to
 //     ~/Library/Application Support/Notepad++/backup/<name>@<yyyy-MM-dd_HHmmss>
 // and an index (backup/index.plist) records per snapshot: the original file path (absent = untitled), the buffer
-// name, and when it was written. The index is cleared when the app terminates normally, so an index still present
-// at the next launch means the previous run died — the user is asked once and those buffers are re-opened with
-// their snapshot text (file-backed: open the file, then re-apply the snapshot; untitled: a new buffer).
+// name, and when it was written.
 // A snapshot file is removed only when its buffer was saved, closed, or restored — never otherwise; a buffer that
 // grows past 64 MB simply stops being re-snapshotted and keeps the last one (N++ stops at its 200 MB large-file mark).
+//
+// SNAPSHOT MODE (-snapshotModeInForce, N++ NppGUI::isSnapshotMode: the preference AND "remember the last session"
+// AND no -nosession) is what decides how a quit ends, and there are exactly two endings:
+//   * in force — the quit does not ask about anything (NPPEditorWindowController skips its prompt, upstream does the
+//     same). Every dirty buffer, untitled ones included, is snapshotted one last time and the index is left on disk
+//     marked `cleanQuit`; the next launch restores them silently, as part of the session. This is what makes an
+//     unsaved "new 1" still be there tomorrow morning.
+//   * off, or a snapshot that could not be written — the quit prompts per file as it always did, and *this run's*
+//     snapshots are spent: they and their index entries are deleted on the way out. Entries an earlier quit left
+//     behind and this run never consumed are written back with the marker they arrived with, so passing through
+//     with snapshots off (or under -nosession) cannot make the launch after it claim a crash.
+// So the index tells the next launch which of three things happened: no index = a quit with nothing to keep;
+// `cleanQuit` = the buffers below were kept on purpose, restore them without a word; no marker (which is also the
+// shape older versions wrote) = the run died, ask once before re-opening anything.
+//
+// INDEX FILE (backup/index.plist), version 2:  { "cleanQuit": <bool>, "entries": [ <entry>, … ] }
+//   version 1 — a bare array of entries — is still read, and still means "the previous run crashed".
 //
 // BACKUP ON SAVE (off by default, like N++) copies the *previous* version of the file before it is overwritten:
 //   simple  -> <file>.bak next to the file
@@ -53,10 +68,17 @@ typedef NS_ENUM(NSInteger, NPPBackupMode) {
 @property (nonatomic, copy, nullable) NSString *customBackupDirectory;    // nil/"" = next to the saved file
 
 @property (nonatomic, readonly) NSURL *snapshotDirectory;                 // …/Notepad++/backup (created by the first write)
-@property (nonatomic, readonly) NSUInteger pendingRestoreCount;           // > 0 == the previous run did not shut down cleanly
+@property (nonatomic, readonly) NSUInteger pendingRestoreCount;           // buffers the previous run left behind
+// N++ NppGUI::isSnapshotMode(): snapshotEnabled && NPPPreferences.rememberLastSession && no -nosession this run.
+// The one copy of the predicate — the window controller asks it rather than keeping a second one that could drift.
+@property (nonatomic, readonly) BOOL snapshotModeInForce;
 
 - (void)takeSnapshotsNow;                                                 // one snapshot pass (what the timer does)
-- (NSInteger)restorePendingWithContext:(id<NPPCommandContext>)context;    // re-opens the crashed run's buffers; returns how many
+// The quit gate. YES = snapshot mode is in force AND every dirty buffer in `documents` is on disk, byte for byte,
+// so the caller must NOT prompt: the buffers come back at the next launch. NO = ask about them as before, and the
+// snapshots stop counting as the surviving copy (they are deleted at termination, as they always were).
+- (BOOL)snapshotDocumentsBeforeQuit:(NSArray<NPPDocument *> *)documents;
+- (NSInteger)restorePendingWithContext:(id<NPPCommandContext>)context;    // re-opens the previous run's buffers; returns how many
 
 // Handled: NPPCmdBackupOpenFolder (always available), NPPCmdBackupRestoreNow (disabled with nothing to restore).
 + (BOOL)handlesCommand:(NPPCmd)cmd;

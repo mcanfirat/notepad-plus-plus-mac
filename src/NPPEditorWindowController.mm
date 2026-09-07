@@ -174,6 +174,36 @@ static BOOL NPPSessionSwitchAllows(BOOL restoringAtLaunch, BOOL *landed) {
     return answer;
 }
 
+// Snapshot mode (N++ NppGUI::isSnapshotMode) is what decides whether quitting asks about unsaved buffers at all:
+// with it on, upstream never prompts — every dirty buffer is written to the backup folder and comes back at the
+// next launch, untitled ones included. NPPBackupManager owns that predicate *and* the files it depends on, so it
+// is asked, by name like every other optional module here, rather than second-guessed with a copy that could
+// drift: it snapshots the documents and answers YES only when every dirty one of them is really on disk.
+// A build without the module, and a nil answer, both mean "ask", which is what this file always did.
+@protocol NPPBackupQuitHost <NSObject>
+- (BOOL)snapshotDocumentsBeforeQuit:(NSArray<NPPDocument *> *)documents;
+// Self-check only, and the reason it is worth a line here: "the quit did not ask" is not the property that matters,
+// "the buffer is on disk" is. Without this the check passes against a gate that answers YES and writes nothing —
+// which is the bug it exists to catch, dressed as a fix.
+- (BOOL)snapshotIsCurrentForDocument:(NPPDocument *)doc;
+@end
+
+static id<NPPBackupQuitHost> NPPBackupQuitHost(void) {
+    Class c = NSClassFromString(@"NPPBackupManager");
+    if (![c respondsToSelector:@selector(shared)]) return nil;
+    id mgr = [c performSelector:@selector(shared)];
+    return [mgr respondsToSelector:@selector(snapshotDocumentsBeforeQuit:)] ? (id<NPPBackupQuitHost>)mgr : nil;
+}
+
+// The other half of the predicate, asked where this file already asks it: -nosession (and the -quickPrint /
+// -export=functionList that imply it) means there is no session to come back to, so nothing survives the quit and
+// the prompt is all that stands between the user and a lost buffer. NPPBackupManager asks NPPCommandLine the same
+// question itself; asking here too costs a line and means a slip in either half fails towards the prompt.
+static BOOL NPPSnapshotQuitCoversDirtyDocuments(NSArray<NPPDocument *> *docs) {
+    if (!NPPSessionSwitchAllows(/*restoringAtLaunch=*/NO, NULL)) return NO;
+    return [NPPBackupQuitHost() snapshotDocumentsBeforeQuit:docs];
+}
+
 // Notepad++ has two edit views, a main and a sub. Everything here is indexed by view: 0 is the main view, 1 the
 // sub view. A document lives in exactly one of them, exactly one view has the focus, and a view with no documents
 // is not shown — so with every document in view 0 the window is laid out exactly as it was before the split
@@ -972,7 +1002,13 @@ static NPPSaveAnswer (^gSaveAnswerStub)(NPPDocument *doc, BOOL offersAll) = nil;
 
 - (BOOL)promptToSaveAllBeforeQuit {
     if (_quitApproved) return YES;
-    if (![self confirmSaveOfDocuments:[self allDocuments]]) return NO;
+    // With snapshot mode in force there is no quit prompt at all (N++ does not ask either): every dirty buffer has
+    // just been written to the backup folder and the next launch brings it back, edits and all. The prompt is still
+    // the answer whenever that is not true — snapshots off, -nosession, no backup module, or a snapshot that could
+    // not be written. Asking about work that is already safe is a nuisance; not asking about work that is not is
+    // the bug this replaces, so the doubtful case asks.
+    if (!NPPSnapshotQuitCoversDirtyDocuments([self allDocuments]) &&
+        ![self confirmSaveOfDocuments:[self allDocuments]]) return NO;
     [self storeSessionInPreferences];
     // A panel closed by its own close button never went through -panelsDidChange, so take the list once more on the
     // way out — N++ writes the *KeepState flags with the rest of its config at shutdown.
@@ -4198,6 +4234,66 @@ static void NPPFill(NPPDocument *doc, NSString *text) {
         prefs.sessionFilePaths = savedPaths;
         prefs.sessionSelectedIndex = savedIndex;
     }
+    // ---- Quitting with unsaved work. With snapshot mode in force (the shipped default) the prompt must not appear
+    // at all: NPPBackupManager has the buffers and the next launch restores them, so "Don't Save" would be asking
+    // the user to destroy the only copy of work they never chose to discard. With it off the prompt is all there
+    // is, and it must still come up once per modified buffer. Both settings are the user's, so both are put back —
+    // and so is the snapshot the first half writes into the real backup folder.
+    {
+        id savedSnapshots = [ud objectForKey:@"NPPBackupSnapshotEnabled"];
+        BOOL savedRemember = prefs.rememberLastSession;
+        NSArray<NSString *> *savedSessionPaths = prefs.sessionFilePaths;
+        NSInteger savedSessionIndex = prefs.sessionSelectedIndex;
+        NSURL *autoURL2 = [wc autoSessionURL];
+        NSData *savedAuto2 = autoURL2 ? [NSData dataWithContentsOfURL:autoURL2] : nil;
+
+        // The stub goes on before anything can ask: every alert here is modal, and a headless run that put one up
+        // would hang rather than fail.
+        __block NSInteger asks = 0;
+        gSaveAnswerStub = ^NPPSaveAnswer(NPPDocument *doc, BOOL offersAll) { asks++; return NPPSaveAnswerDont; };
+        if (![wc closeAllDocuments]) [f addObject:@"the quit-prompt check could not clear the window first"];
+        NPPDocument *unsaved = wc.currentDocument;                       // the fresh buffer that leaves behind
+        NPPSciStr(unsaved.editor, SCI_INSERTTEXT, 0, "work in progress");
+        asks = 0;
+
+        prefs.rememberLastSession = YES;
+        [ud setBool:YES forKey:@"NPPBackupSnapshotEnabled"];
+        if (!unsaved.isDirty) [f addObject:@"the quit-prompt check has no modified buffer, so it proves nothing"];
+        if (![wc promptToSaveAllBeforeQuit]) [f addObject:@"quitting was cancelled with snapshot mode on"];
+        if (asks)
+            [f addObject:[NSString stringWithFormat:@"snapshot mode is on and the quit still asked about %ld unsaved "
+                          @"buffer(s): answering \"Don't Save\" there destroys the only copy", (long)asks]];
+        // Not asking is only right because the work is already on disk. Ask the manager whether it really is, so a
+        // gate that answered YES without writing anything fails here rather than at the user's next launch.
+        if (![NPPBackupQuitHost() snapshotIsCurrentForDocument:unsaved])
+            [f addObject:@"the quit skipped its prompt but the modified buffer is not in the backup folder: "
+                         @"nothing would come back at the next launch"];
+
+        // Put the backup folder back: the buffer is clean now, so the manager's own pass prunes what it just wrote.
+        NPPSci(unsaved.editor, SCI_SETSAVEPOINT);
+        [NPPBackupQuitHost() snapshotDocumentsBeforeQuit:[wc documents]];
+
+        [ud setBool:NO forKey:@"NPPBackupSnapshotEnabled"];
+        NPPSciStr(unsaved.editor, SCI_INSERTTEXT, 0, "more work");
+        asks = 0;
+        if (![wc promptToSaveAllBeforeQuit]) [f addObject:@"quitting was cancelled with snapshot mode off"];
+        if (asks != 1)
+            [f addObject:[NSString stringWithFormat:@"snapshot mode is off: the quit asked %ld time(s) about one "
+                          @"modified buffer, want 1", (long)asks]];
+        gSaveAnswerStub = nil;                                            // never leave the app answering its own prompts
+        NPPSci(unsaved.editor, SCI_SETSAVEPOINT);
+
+        if (savedSnapshots) [ud setObject:savedSnapshots forKey:@"NPPBackupSnapshotEnabled"];
+        else [ud removeObjectForKey:@"NPPBackupSnapshotEnabled"];
+        prefs.rememberLastSession = savedRemember;
+        prefs.sessionFilePaths = savedSessionPaths;
+        prefs.sessionSelectedIndex = savedSessionIndex;
+        if (autoURL2) {
+            if (savedAuto2) [savedAuto2 writeToURL:autoURL2 options:NSDataWritingAtomic error:NULL];
+            else [fm removeItemAtURL:autoURL2 error:NULL];
+        }
+    }
+
     prefs.recentFilePaths = savedRecents;
     [fm removeItemAtURL:tmp error:NULL];
 }

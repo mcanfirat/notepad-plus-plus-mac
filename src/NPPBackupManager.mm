@@ -36,6 +36,11 @@ static NSString *const kPathKey     = @"path";       // original file, absent fo
 static NSString *const kNameKey     = @"name";       // buffer display name ("notes.txt", "new 1")
 static NSString *const kModifiedKey = @"modified";   // when the snapshot was written
 
+// The index file itself, version 2: a dictionary so the entries can be marked. Version 1 was the bare array and is
+// still read — it can only have been left behind by a run that died, which is exactly what no marker means here.
+static NSString *const kEntriesKey   = @"entries";
+static NSString *const kCleanQuitKey = @"cleanQuit";   // YES == kept on purpose by a quit, not left behind by a crash
+
 static NSString *const kIndexFileName = @"index.plist";
 static NSString *const kVerboseSubdir = @"nppBackup";              // N++ fileSave() bak_verbose sub folder
 static const NSTimeInterval kDefaultInterval = 7.0;                // N++ _snapshotBackupTiming = 7000 ms
@@ -112,6 +117,12 @@ static NSArray<NSString *> *NPPBackupAbsentSessionPaths(NSArray<NSString *> *ses
     return out;
 }
 
+// What a buffer holds, as a string — the self-check's way of asking "did the text really come back?".
+static NSString *NPPBackupTextOf(NPPDocument *doc) {
+    std::string text = NPPSciGetText(doc.editor);
+    return [[NSString alloc] initWithBytes:text.data() length:text.size() encoding:NSUTF8StringEncoding] ?: @"";
+}
+
 static NSTimeInterval NPPBackupClampInterval(NSTimeInterval v) {
     if (!(v > 0)) return kDefaultInterval;                          // 0, negative and NaN all mean "unset"
     return MIN(MAX(v, kMinInterval), kMaxInterval);
@@ -126,12 +137,25 @@ static BOOL NPPBackupAutomatedRun(void) {
     return NO;
 }
 
+// The two things that must never run by themselves against the *user's* backup folder: the timer, and the launch
+// restore. --selftest builds throw-away window controllers and each one posts the ready notification, so the
+// silent clean-quit restore would adopt the user's real unsaved work into a controller nobody sees — and the next
+// pass, over some later controller's documents, would then prune those files as stale. The checks drive both by
+// hand over a scratch folder, so nothing is lost by standing down here; snapshot mode itself is deliberately NOT
+// gated on this, because the checks have to be able to prove what a real quit does.
+static BOOL NPPBackupHeadlessRun(void) {
+    return NPPBackupAutomatedRun() || [NSProcessInfo.processInfo.arguments containsObject:@"--selftest"];
+}
+
 #pragma mark - Save hook
 
 @interface NPPBackupManager ()
 - (void)backupPreviousVersionOfFileAtURL:(NSURL *)url;
 - (instancetype)initWithSnapshotDirectory:(nullable NSURL *)directory;   // nil = the real backup folder
 - (void)persistIndex;
+- (void)persistIndexCleanQuit:(BOOL)cleanQuit;
+- (void)takeSnapshotPassOverDocuments:(NSArray<NPPDocument *> *)documents;
+- (void)restorePendingAtLaunch;
 - (void)applicationWillTerminate;
 @end
 
@@ -143,6 +167,13 @@ static BOOL NPPBackupAutomatedRun(void) {
 // NPPDocument posts NPPDocumentWillSaveNotification just before it writes; observing that is the whole hook.
 // (This used to be a swizzle of -saveToURL:error: because the seam did not exist yet.)
 static BOOL gSaveHookInstalled = NO;
+
+// The context +selfCheckFailures hands the manager: enough of id<NPPCommandContext> to open a file, make an empty
+// buffer and be told what happened. No window, on purpose — a check that reached the real restore prompt would put
+// a modal alert on screen and never come back (gRestoreAnswerStub answers it, and counts it, instead).
+@interface NPPBackupCheckContext : NSObject <NPPCommandContext, NPPBackupHostNewDocument>
+@property (nonatomic, strong) NSMutableArray<NPPDocument *> *docs;
+@end
 
 #pragma mark - Manager
 
@@ -156,6 +187,11 @@ static BOOL gSaveHookInstalled = NO;
     BOOL _passing;                                                // a snapshot pass is running (see -takeSnapshotsNow)
     NSDate *_lastPassDate;
     NSURL *_snapshotDirectoryOverride;                            // self-check only; nil = the real backup folder
+    BOOL _pendingWasCleanQuit;                                    // the index we found says "kept on purpose", not "crashed"
+    // Set by -snapshotDocumentsBeforeQuit: when it had to answer NO. The quit then asked about every dirty buffer,
+    // so the snapshots are spent whatever the preference says: keeping them would resurrect, at the next launch, a
+    // buffer the user just answered "Don't Save" to. NO by default, so a quit route that never asks keeps them.
+    BOOL _quitPromptedInstead;
 }
 
 + (void)load {
@@ -194,8 +230,12 @@ static BOOL gSaveHookInstalled = NO;
         _snapshotDirectoryOverride = directory;
         _index = [NSMutableDictionary dictionary];
         _docState = [NSMapTable weakToStrongObjectsMapTable];      // a closed document drops out by itself
-        // An index left on disk means the previous run never reached applicationWillTerminate: a crash.
-        _pending = [[NPPBackupManager indexEntriesAtURL:self.indexFileURL] mutableCopy];
+        // An index left on disk is either a quit that kept its snapshots on purpose (snapshot mode: it says so) or a
+        // run that never reached applicationWillTerminate at all — a crash. The marker is the whole difference, and
+        // an index without one (every index older versions wrote) is read as the crash it was.
+        BOOL clean = NO;
+        _pending = [[NPPBackupManager indexEntriesAtURL:self.indexFileURL cleanQuit:&clean] mutableCopy];
+        _pendingWasCleanQuit = clean;
         NSFileManager *fm = NSFileManager.defaultManager;
         NSURL *dir = self.snapshotDirectory;
         for (NSInteger i = (NSInteger)_pending.count - 1; i >= 0; i--) {   // drop entries whose file is gone
@@ -225,6 +265,20 @@ static BOOL gSaveHookInstalled = NO;
 - (void)setSnapshotInterval:(NSTimeInterval)interval {
     [NSUserDefaults.standardUserDefaults setDouble:NPPBackupClampInterval(interval) forKey:kSnapshotIntervalKey];
     [self rescheduleTimer];
+}
+
+// N++ Parameters.h: isSnapshotMode() == _isSnapshotMode && _rememberLastSession && !_isCmdlineNosessionActivated.
+// The single copy of the predicate: -applicationWillTerminate, the launch restore and (through
+// -snapshotDocumentsBeforeQuit:) the window controller's quit prompt all ask this one method, so the three can
+// never end up disagreeing about whether unsaved work is being kept.
+- (BOOL)snapshotModeInForce {
+    // An automated run takes no snapshots at all (see -attachToContext:), so it must never be told the unsaved work
+    // is safe: whatever asks this falls back to what it did before there were snapshots.
+    if (NPPBackupAutomatedRun()) return NO;
+    if (!self.snapshotEnabled || !NPPPreferences.shared.rememberLastSession) return NO;
+    // -nosession (implied by -quickPrint / -export=functionList): no session to come back to, so nothing is kept
+    // across the quit and the prompt is the only thing standing between the user and a lost buffer.
+    return [NPPCommandLine shouldSaveSessionOnQuit];
 }
 
 - (NPPBackupMode)backupMode {
@@ -322,19 +376,37 @@ static BOOL gSaveHookInstalled = NO;
     return NO;
 }
 
-+ (NSData *)indexDataForEntries:(NSArray<NSDictionary *> *)entries {
-    return [NSPropertyListSerialization dataWithPropertyList:(entries ?: @[])
++ (NSData *)indexDataForEntries:(NSArray<NSDictionary *> *)entries { return [self indexDataForEntries:entries cleanQuit:NO]; }
+
++ (NSData *)indexDataForEntries:(NSArray<NSDictionary *> *)entries cleanQuit:(BOOL)cleanQuit {
+    NSDictionary *index = @{kCleanQuitKey: @(cleanQuit), kEntriesKey: (entries ?: @[])};
+    return [NSPropertyListSerialization dataWithPropertyList:index
                                                       format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
 }
 
++ (NSArray<NSDictionary *> *)entriesFromIndexData:(NSData *)data { return [self entriesFromIndexData:data cleanQuit:NULL]; }
+
 // Tolerant on purpose: a half-written or hand-edited index must degrade to "nothing to restore", never crash.
-+ (NSArray<NSDictionary *> *)entriesFromIndexData:(NSData *)data {
+// Two shapes are accepted — the v2 dictionary, and the bare array v1 wrote, which carries no marker and so means
+// what a leftover index has always meant: the previous run died. `cleanQuit` is NO for anything it cannot read.
++ (NSArray<NSDictionary *> *)entriesFromIndexData:(NSData *)data cleanQuit:(BOOL *)cleanQuit {
+    if (cleanQuit) *cleanQuit = NO;
     if (!data.length) return @[];
     id plist = [NSPropertyListSerialization propertyListWithData:data options:NSPropertyListImmutable
                                                           format:NULL error:NULL];
-    if (![plist isKindOfClass:NSArray.class]) return @[];
+    NSArray *list = nil;
+    if ([plist isKindOfClass:NSArray.class]) {
+        list = plist;                                                   // v1: an index left behind by a crash
+    } else if ([plist isKindOfClass:NSDictionary.class]) {
+        id entries = ((NSDictionary *)plist)[kEntriesKey], flag = ((NSDictionary *)plist)[kCleanQuitKey];
+        list = [entries isKindOfClass:NSArray.class] ? entries : nil;
+        // `list &&`: an index whose entries do not parse is an index that does not parse, and one of those never
+        // gets to claim it came from a clean quit.
+        if (cleanQuit) *cleanQuit = list && [flag isKindOfClass:NSNumber.class] && [flag boolValue];
+    }
+    if (!list) return @[];
     NSMutableArray<NSDictionary *> *out = [NSMutableArray array];
-    for (id item in (NSArray *)plist) {
+    for (id item in list) {
         if (![item isKindOfClass:NSDictionary.class]) continue;
         NSString *snapshot = ((NSDictionary *)item)[kSnapshotKey];
         if (![snapshot isKindOfClass:NSString.class]) continue;
@@ -344,27 +416,39 @@ static BOOL gSaveHookInstalled = NO;
     return out;
 }
 
-+ (NSArray<NSDictionary *> *)indexEntriesAtURL:(NSURL *)url {
-    return [self entriesFromIndexData:[NSData dataWithContentsOfURL:url]];
++ (NSArray<NSDictionary *> *)indexEntriesAtURL:(NSURL *)url { return [self indexEntriesAtURL:url cleanQuit:NULL]; }
+
++ (NSArray<NSDictionary *> *)indexEntriesAtURL:(NSURL *)url cleanQuit:(BOOL *)cleanQuit {
+    return [self entriesFromIndexData:[NSData dataWithContentsOfURL:url] cleanQuit:cleanQuit];
 }
 
 + (BOOL)writeIndexEntries:(NSArray<NSDictionary *> *)entries toURL:(NSURL *)url {
+    return [self writeIndexEntries:entries cleanQuit:NO toURL:url];
+}
+
++ (BOOL)writeIndexEntries:(NSArray<NSDictionary *> *)entries cleanQuit:(BOOL)cleanQuit toURL:(NSURL *)url {
     if (!url) return NO;
-    if (entries.count == 0) {                                        // no index == the previous run ended cleanly
+    if (entries.count == 0) {                                        // nothing to come back to: no index at all
         [NSFileManager.defaultManager removeItemAtURL:url error:NULL];
         return ![NSFileManager.defaultManager fileExistsAtPath:url.path];
     }
-    NSData *data = [self indexDataForEntries:entries];
+    NSData *data = [self indexDataForEntries:entries cleanQuit:cleanQuit];
     if (!data) return NO;
     [NSFileManager.defaultManager createDirectoryAtURL:url.URLByDeletingLastPathComponent
                            withIntermediateDirectories:YES attributes:nil error:NULL];
     return [data writeToURL:url options:NSDataWritingAtomic error:NULL];   // atomic: a crash keeps the old index
 }
 
-- (void)persistIndex {
+- (void)persistIndex { [self persistIndexCleanQuit:NO]; }
+
+// ponytail: one marker for the whole file, not one per entry — so entries a crash left pending, and that the user
+// has not answered for yet, are marked clean too when this run quits in snapshot mode, and come back silently
+// instead of behind the prompt. That keeps more, and asks less; give each entry its own flag if "you were asked
+// about this one already" ever has to survive a quit.
+- (void)persistIndexCleanQuit:(BOOL)cleanQuit {
     NSMutableArray<NSDictionary *> *all = [_pending mutableCopy];
     [all addObjectsFromArray:_index.allValues];   // pending entries stay until restored or declined
-    [NPPBackupManager writeIndexEntries:all toURL:self.indexFileURL];
+    [NPPBackupManager writeIndexEntries:all cleanQuit:cleanQuit toURL:self.indexFileURL];
 }
 
 #pragma mark Snapshots
@@ -394,7 +478,14 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
 // changed multi-megabyte buffer costs one file write per pass; move the write off-thread if that ever shows up.
 - (void)takeSnapshotsNow {
     id<NPPCommandContext> ctx = _context;
-    if (!ctx || _passing || !self.snapshotEnabled) return;
+    if (!ctx) return;
+    [self takeSnapshotPassOverDocuments:[ctx contextOpenDocuments]];
+}
+
+// The documents are a parameter so the quit can hand over exactly the buffers it is about to stop asking about
+// (and so the self-check can drive a pass with no window at all).
+- (void)takeSnapshotPassOverDocuments:(NSArray<NPPDocument *> *)documents {
+    if (_passing || !self.snapshotEnabled) return;
     // Opening a buffer during a restore re-broadcasts NPPCurrentDocumentDidChangeNotification, which lands straight
     // back here; a pass running mid-restore would prune the very snapshots the restore has not adopted yet.
     _passing = YES;
@@ -404,7 +495,7 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
     NSMutableSet<NSString *> *live = [NSMutableSet set];
     BOOL changed = NO;
 
-    for (NPPDocument *doc in [ctx contextOpenDocuments]) {
+    for (NPPDocument *doc in documents) {
         ScintillaView *ed = doc.editor;
         if (!doc.isDirty || !ed) continue;
         NSMutableDictionary *state = [_docState objectForKey:doc];
@@ -446,10 +537,39 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
     _passing = NO;
 }
 
+// Is this buffer's snapshot on disk and byte for byte what the buffer holds? The hash is the one the pass writes,
+// and it is only ever stored after a *successful* write — so a full disk, an unwritable backup folder or a buffer
+// too large to snapshot all answer NO here, which is what stops the quit from skipping its prompt.
+- (BOOL)snapshotIsCurrentForDocument:(NPPDocument *)doc {
+    ScintillaView *ed = doc.editor;
+    NSDictionary *state = [_docState objectForKey:doc];
+    NSString *snapshot = [state[kSnapshotKey] isKindOfClass:NSString.class] ? state[kSnapshotKey] : nil;
+    if (!ed || !snapshot || !_index[snapshot] || !state[@"hash"]) return NO;
+    const char *chars = (const char *)NPPSci(ed, SCI_GETCHARACTERPOINTER);
+    if (!chars) return NO;
+    if ([state[@"hash"] unsignedLongLongValue] != NPPBackupHash(chars, (size_t)NPPSci(ed, SCI_GETLENGTH))) return NO;
+    return [NSFileManager.defaultManager fileExistsAtPath:
+            [self.snapshotDirectory URLByAppendingPathComponent:snapshot].path];
+}
+
+// N++ Notepad_plus::fileCloseAll(isSnapshotMode): with snapshots on, quitting asks about nothing at all — the
+// buffers are written out and re-opened next time. Answering that here rather than in the window controller keeps
+// the decision next to the files it depends on: this returns YES only when every dirty buffer really is on disk.
+- (BOOL)snapshotDocumentsBeforeQuit:(NSArray<NPPDocument *> *)documents {
+    BOOL covered = self.snapshotModeInForce;
+    if (covered) {
+        [self takeSnapshotPassOverDocuments:documents];
+        for (NPPDocument *doc in documents)
+            if (doc.isDirty && ![self snapshotIsCurrentForDocument:doc]) { covered = NO; break; }
+    }
+    _quitPromptedInstead = !covered;
+    return covered;
+}
+
 - (void)rescheduleTimer {
     [_timer invalidate];
     _timer = nil;
-    if (!_context || !self.snapshotEnabled || NPPBackupAutomatedRun()) return;
+    if (!_context || !self.snapshotEnabled || NPPBackupHeadlessRun()) return;
     NSTimeInterval interval = self.snapshotInterval;
     __weak __typeof__(self) weakSelf = self;
     // ponytail: one repeating timer that returns immediately when nothing is dirty, rather than start/stop
@@ -475,12 +595,12 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
 - (void)attachToContext:(id<NPPCommandContext>)context {
     if (!context) return;
     _context = context;
-    if (NPPBackupAutomatedRun()) return;
+    if (NPPBackupHeadlessRun()) return;
     [self rescheduleTimer];
     // Let the window finish coming up before a sheet lands on it — and, for the placeholders, before the window
     // controller and the app delegate have finished opening the readable half of the session.
     dispatch_async(dispatch_get_main_queue(), ^{
-        [self promptForRestoreIfNeeded];
+        [self restorePendingAtLaunch];
         [self openPlaceholdersForAbsentSessionFiles];
     });
 }
@@ -524,14 +644,28 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
 - (void)applicationWillTerminate {
     [_timer invalidate];
     _timer = nil;
-    // Every dirty buffer was just answered for by the quit prompt (Save / Don't Save), so this run's snapshots are
-    // spent. Clearing the index is what tells the next launch that the shutdown was clean.
+    // Snapshot mode: nothing was answered for on the way out (there was no prompt), so these snapshots are the only
+    // copy of the unsaved work. One last pass — every quit route ends here, including the ones that never reach the
+    // window controller — and then leave both the files and the index, marked as a quit that kept them on purpose.
+    if (self.snapshotModeInForce && !_quitPromptedInstead) {
+        id<NPPCommandContext> ctx = _context;
+        if (ctx) [self takeSnapshotPassOverDocuments:[ctx contextOpenDocuments]];
+        [self persistIndexCleanQuit:YES];
+        return;
+    }
+    // Otherwise every dirty buffer was just answered for by the quit prompt (Save / Don't Save), so this run's
+    // snapshots are spent. Clearing the index is what tells the next launch that the shutdown was clean.
     // ponytail: one running instance is assumed, as in N++ — give the index a per-instance name if the port ever
     // allows two windows' worth of app to run at once.
     NSURL *dir = self.snapshotDirectory;
     for (NSString *snapshot in _index.allKeys) [NPPBackupManager removeSnapshotNamed:snapshot inDirectory:dir];
     [_index removeAllObjects];
-    [self persistIndex];
+    // What is left is exactly what this run found and never consumed, so it keeps the marker it arrived with. A run
+    // that kept nothing of its own — snapshots off, or -nosession — must not downgrade an earlier quit's clean-quit
+    // index to a crash: that would greet the next launch with "Notepad++ did not shut down properly" about buffers
+    // nothing ever crashed on, and there is no taking that back. _pending only ever shrinks, so one flag still
+    // describes all of it.
+    [self persistIndexCleanQuit:_pendingWasCleanQuit];
 }
 
 #pragma mark Restore
@@ -543,6 +677,16 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
     // it does not know to balance — one leaked document and its ScintillaView per restored untitled buffer.
     if (![(id)ctx respondsToSelector:@selector(newDocument)]) return nil;
     return [(id<NPPBackupHostNewDocument>)ctx newDocument];
+}
+
+// The window always comes up with an empty "new 1". N++ brings a restored untitled buffer back *as* that buffer
+// rather than beside it, which is what "my unsaved new 1 was still there" looks like — and it is only ever an
+// empty, never-edited one, so nothing can be overwritten. After the text goes in it is dirty, so the next entry
+// in the same restore cannot adopt it too.
+- (NPPDocument *)adoptableUntitledDocumentInContext:(id<NPPCommandContext>)ctx {
+    for (NPPDocument *doc in [ctx contextOpenDocuments])
+        if (doc.isUntitled && !doc.isDirty && doc.editor && NPPSci(doc.editor, SCI_GETLENGTH) == 0) return doc;
+    return nil;
 }
 
 - (BOOL)restoreEntry:(NSDictionary *)entry context:(id<NPPCommandContext>)ctx {
@@ -558,9 +702,19 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
     NPPDocument *doc = nil;
     if (path.length && [NSFileManager.defaultManager fileExistsAtPath:path])
         doc = [ctx contextOpenFileURL:[NSURL fileURLWithPath:path]];
-    if (!doc) doc = [self newUntitledDocumentWithContext:ctx];      // untitled, or the file has since disappeared
+    // Untitled, or the file has since disappeared — either way the text must land somewhere, so an empty untitled
+    // buffer is taken over if there is one and a fresh one made if there is not.
+    if (!doc) doc = [self adoptableUntitledDocumentInContext:ctx] ?: [self newUntitledDocumentWithContext:ctx];
     ScintillaView *ed = doc.editor;
     if (!ed) return NO;
+    // The file was deleted or renamed while the app was closed, so this snapshot is the only copy of it left. Give
+    // the buffer its path back instead of dropping the text into an anonymous "new 1": the tab is still called what
+    // the user called it, and the entry keeps naming the file if this has to happen again. Only for a path that is
+    // really gone: a file that is there but would not open (unreadable, or a .session the context handled itself)
+    // may already have a document somewhere, and two tabs claiming one path is its own bug. Nothing is overwritten
+    // either way — -saveDocument: sends a buffer whose file is missing to Save As, on the right name and folder.
+    if (path.length && !doc.fileURL && ![NSFileManager.defaultManager fileExistsAtPath:path])
+        doc.fileURL = [NSURL fileURLWithPath:path];
 
     // Re-apply the snapshot on top of what was loaded and leave the buffer dirty — that is the whole point.
     // SCI_ADDTEXT is length-based (SCI_SETTEXT would stop at an embedded NUL), and the replacement stays one
@@ -601,8 +755,35 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
     return restored;
 }
 
-- (void)promptForRestoreIfNeeded {
+// What the crash prompt would have answered, and that it was put up at all. Set only by +selfCheckFailures: the
+// alert is modal, so a check that reached the real one would never return — and "no prompt at all" is precisely
+// what the clean-quit restore has to prove.
+static NSInteger gRestorePromptCount = 0;
+static NSModalResponse (^gRestoreAnswerStub)(NSArray<NSDictionary *> *pending) = nil;
+
+// The one thing the launch does with what the previous run left behind. Two endings, told apart by the index's own
+// marker (see the header): a quit that kept its snapshots on purpose restores them silently, as part of the
+// session the user is expecting back; a run that died still asks first.
+- (void)restorePendingAtLaunch {
     if (_restorePrompted || _pending.count == 0) return;
+    id<NPPCommandContext> ctx = _context;
+    if (!ctx) return;
+    if (_pendingWasCleanQuit) {
+        // Kept on purpose, so there is nothing to announce and nothing to ask. Only where this launch is restoring
+        // a session at all, though: under -nosession, or with the snapshot preference since switched off, they stay
+        // on disk and stay in the index ("Restore Unsaved Documents" is one menu item away, and the next launch that
+        // does restore a session brings them back). Never the crash prompt — that run did not crash.
+        if (!self.snapshotModeInForce || ![NPPCommandLine shouldRestoreSavedSession]) return;
+        _restorePrompted = YES;
+        NSInteger n = [self restorePendingWithContext:ctx];
+        if (n) [ctx contextReportStatus:[NSString stringWithFormat:
+            NSLocalizedString(@"Restored %ld unsaved document(s) from the last session", nil), (long)n] isError:NO];
+        return;
+    }
+    [self promptForRestore];
+}
+
+- (void)promptForRestore {
     id<NPPCommandContext> ctx = _context;
     if (!ctx) return;
     _restorePrompted = YES;
@@ -640,6 +821,7 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
         }
         [self_->_context contextRefreshUI];
     };
+    if (gRestoreAnswerStub) { gRestorePromptCount++; handle(gRestoreAnswerStub([_pending copy])); return; }
     NSWindow *window = [ctx contextWindow];
     if (window) [alert beginSheetModalForWindow:window completionHandler:handle];
     else handle([alert runModal]);
@@ -901,9 +1083,211 @@ static NSDictionary *NPPBackupEntry(NPPDocument *doc, NSString *snapshot) {
               @"snapshotDirectory would not follow a -settingsDir= that names a real directory");
     }
 
+    // 14. the marker that tells a quit which kept its snapshots from a run that died — and the old format, which
+    //     has no marker and can only have come from a run that died.
+    {
+        BOOL clean = YES;
+        NSData *v1 = [NSPropertyListSerialization dataWithPropertyList:entries
+                                                                format:NSPropertyListBinaryFormat_v1_0 options:0 error:NULL];
+        CHECK([self entriesFromIndexData:v1 cleanQuit:&clean].count == 2 && !clean,
+              @"a version-1 index (the bare array older versions wrote) must still read back, and still mean a crash");
+        clean = NO;
+        CHECK([self entriesFromIndexData:[self indexDataForEntries:entries cleanQuit:YES] cleanQuit:&clean].count == 2 && clean,
+              @"the clean-quit marker did not survive the index round trip");
+        clean = YES;
+        CHECK([self entriesFromIndexData:[self indexDataForEntries:entries cleanQuit:NO] cleanQuit:&clean].count == 2 && !clean,
+              @"an index written without the marker came back claiming a clean quit");
+        clean = YES;
+        CHECK([self entriesFromIndexData:[@"not a plist" dataUsingEncoding:NSUTF8StringEncoding] cleanQuit:&clean].count == 0 && !clean,
+              @"a corrupt index must be nothing to restore, and must never claim a clean quit");
+    }
+
+    // 15. what the user actually asked for, driven end to end: two dirty buffers (one never saved, one a file with
+    //     unsaved edits), a quit that asks nothing, a relaunch, and the text back — with no prompt anywhere. Then
+    //     the same folder as a crash, which must still ask. Snapshot mode has to be in force for any of it, and
+    //     that reads the user's own settings, so they are set here and put back at the end.
+    {
+        NSUserDefaults *ud = NSUserDefaults.standardUserDefaults;
+        id savedEnabled = [ud objectForKey:kSnapshotEnabledKey];
+        BOOL savedRemember = NPPPreferences.shared.rememberLastSession;
+        [ud setBool:YES forKey:kSnapshotEnabledKey];
+        NPPPreferences.shared.rememberLastSession = YES;
+
+        NSURL *keptDir = [box URLByAppendingPathComponent:@"kept" isDirectory:YES];
+        NSURL *editedURL = [box URLByAppendingPathComponent:@"edited.txt"];
+        [@"on disk\n" writeToURL:editedURL atomically:YES encoding:NSUTF8StringEncoding error:NULL];
+
+        NPPBackupManager *quitting = [[NPPBackupManager alloc] initWithSnapshotDirectory:keptDir];
+        CHECK(quitting.snapshotModeInForce,
+              @"the preference is on, the last session is remembered and there is no -nosession, "
+              @"but snapshot mode is not in force");
+        NPPPreferences.shared.rememberLastSession = NO;
+        CHECK(!quitting.snapshotModeInForce,
+              @"snapshot mode ignores \"remember the last session\": a quit would keep work no launch brings back");
+        NPPPreferences.shared.rememberLastSession = YES;
+
+        NPPDocument *untitled = [[NPPDocument alloc] initUntitled];
+        NPPSciStr(untitled.editor, SCI_ADDTEXT, 8, "untitled");
+        NPPDocument *editedDoc = [[NPPDocument alloc] initWithContentsOfURL:editedURL error:NULL];
+        NPPSciStr(editedDoc.editor, SCI_INSERTTEXT, 0, "edited ");
+        NSArray<NPPDocument *> *dirty = editedDoc ? @[untitled, editedDoc] : @[untitled];
+        CHECK(editedDoc != nil && untitled.isDirty && editedDoc.isDirty,
+              @"the clean-quit check could not produce the two dirty buffers it quits with");
+
+        CHECK([quitting snapshotDocumentsBeforeQuit:dirty],
+              @"snapshot mode is in force and both buffers were snapshotted, but the quit was still told to ask");
+        [quitting applicationWillTerminate];                       // ⌘Q
+
+        BOOL marker = NO;
+        NSURL *keptIndex = [keptDir URLByAppendingPathComponent:kIndexFileName];
+        CHECK([self indexEntriesAtURL:keptIndex cleanQuit:&marker].count == 2 && marker,
+              @"quitting in snapshot mode must leave both snapshots behind, marked as a clean quit");
+
+        // Relaunch: a fresh manager over the same folder, and the empty "new 1" every window comes up with.
+        NPPBackupCheckContext *relaunch = [NPPBackupCheckContext new];
+        NPPDocument *newOne = [relaunch newDocument];
+        NPPBackupManager *relaunched = [[NPPBackupManager alloc] initWithSnapshotDirectory:keptDir];
+        relaunched->_context = relaunch;
+        CHECK(relaunched.pendingRestoreCount == 2,
+              ([NSString stringWithFormat:@"the relaunch found %lu of the 2 buffers the quit kept",
+                (unsigned long)relaunched.pendingRestoreCount]));
+        gRestorePromptCount = 0;
+        gRestoreAnswerStub = ^NSModalResponse(NSArray<NSDictionary *> *pending) { return NSAlertFirstButtonReturn; };
+        [relaunched restorePendingAtLaunch];
+        CHECK(gRestorePromptCount == 0,
+              @"a quit that kept its snapshots on purpose still asked the next launch whether to restore them");
+        CHECK(relaunched.pendingRestoreCount == 0, @"the silent restore left the buffers pending");
+
+        NPPDocument *backUntitled = nil, *backFile = nil;
+        for (NPPDocument *d in relaunch.docs) { if (d.fileURL) backFile = d; else backUntitled = d; }
+        CHECK(backUntitled == newOne, @"the restored untitled buffer did not come back as the empty \"new 1\"");
+        CHECK([NPPBackupTextOf(backUntitled) isEqualToString:@"untitled"],
+              @"a buffer that had never been saved came back without its text");
+        CHECK(backUntitled.isDirty, @"the restored untitled buffer came back clean: the next quit would drop it");
+        CHECK([NPPBackupTextOf(backFile) isEqualToString:@"edited on disk\n"],
+              ([NSString stringWithFormat:@"a saved file with unsaved edits came back as \"%@\", want the edits",
+                NPPBackupTextOf(backFile)]));
+        CHECK(backFile.isDirty, @"a restored file with unsaved edits came back clean, so the edits look saved");
+
+        // The same two buffers left behind *without* the marker — a crash — still get asked about, which is also
+        // what makes the "no prompt" checks above mean anything: this counter can go up.
+        NSURL *diedDir = [box URLByAppendingPathComponent:@"died" isDirectory:YES];
+        [self writeSnapshotData:probe named:@"new 1@2026-01-02_030405" inDirectory:diedDir];
+        [self writeIndexEntries:@[@{kSnapshotKey: @"new 1@2026-01-02_030405", kNameKey: @"new 1", kModifiedKey: when}]
+                      cleanQuit:NO toURL:[diedDir URLByAppendingPathComponent:kIndexFileName]];
+        NPPBackupCheckContext *afterCrash = [NPPBackupCheckContext new];
+        NPPBackupManager *crashed = [[NPPBackupManager alloc] initWithSnapshotDirectory:diedDir];
+        crashed->_context = afterCrash;
+        [crashed restorePendingAtLaunch];
+        gRestoreAnswerStub = nil;
+        CHECK(gRestorePromptCount == 1, @"an index with no clean-quit marker did not ask before restoring anything");
+        CHECK(afterCrash.docs.count == 1 && [NPPBackupTextOf(afterCrash.docs.firstObject) isEqualToString:@"unsaved text"],
+              @"answering the crash prompt with Restore did not bring the buffer back");
+
+        // The file was deleted (or renamed) while the app was closed, so the snapshot is now the only copy of it
+        // anywhere. It has to come back carrying the path it had — text alone, in an anonymous "new 1", makes the
+        // user work out where it belonged before they can save it.
+        NSURL *goneDir = [box URLByAppendingPathComponent:@"gone" isDirectory:YES];
+        NSString *goneSnap = @"gone.txt@2026-01-02_030405";
+        NSString *gonePath = [box URLByAppendingPathComponent:@"deleted-while-away.txt"].path;   // never created
+        [self writeSnapshotData:probe named:goneSnap inDirectory:goneDir];
+        [self writeIndexEntries:@[@{kSnapshotKey: goneSnap, kNameKey: @"gone.txt", kPathKey: gonePath, kModifiedKey: when}]
+                      cleanQuit:YES toURL:[goneDir URLByAppendingPathComponent:kIndexFileName]];
+        NPPBackupCheckContext *afterGone = [NPPBackupCheckContext new];
+        NPPBackupManager *goneRun = [[NPPBackupManager alloc] initWithSnapshotDirectory:goneDir];
+        goneRun->_context = afterGone;
+        gRestorePromptCount = 0;
+        gRestoreAnswerStub = ^NSModalResponse(NSArray<NSDictionary *> *pending) { return NSAlertFirstButtonReturn; };
+        [goneRun restorePendingAtLaunch];
+        gRestoreAnswerStub = nil;
+        NPPDocument *goneBack = afterGone.docs.firstObject;
+        CHECK(afterGone.docs.count == 1 && [NPPBackupTextOf(goneBack) isEqualToString:@"unsaved text"] &&
+              goneBack.isDirty && [goneBack.fileURL.path isEqualToString:gonePath],
+              ([NSString stringWithFormat:@"a snapshot whose file was deleted while the app was closed came back as "
+                @"%lu buffer(s) named %@ holding \"%@\", want one dirty buffer at %@ holding its text",
+                (unsigned long)afterGone.docs.count, goneBack.fileURL.path ?: @"(untitled)",
+                NPPBackupTextOf(goneBack), gonePath]));
+        CHECK(gRestorePromptCount == 0, @"restoring a clean quit's buffer whose file had gone put up the crash prompt");
+
+        // A snapshot that cannot be written must never be mistaken for one that was: the quit falls back to asking.
+        // "notes.txt" is a file (check 5), so a folder underneath it can never be created — a full disk in miniature.
+        NPPBackupManager *doomed = [[NPPBackupManager alloc] initWithSnapshotDirectory:
+                                    [[box URLByAppendingPathComponent:@"notes.txt"]
+                                     URLByAppendingPathComponent:@"backup" isDirectory:YES]];
+        CHECK(![doomed snapshotDocumentsBeforeQuit:dirty],
+              @"the quit was told not to ask although the snapshots could not be written at all");
+
+        // Snapshot mode off: the quit asks (as it always did), and this run's snapshots are spent — deleted, index
+        // and all, on the way out. The pass runs with the preference still on so there is something to delete.
+        NSURL *spentDir = [box URLByAppendingPathComponent:@"spent" isDirectory:YES];
+        NPPBackupManager *spending = [[NPPBackupManager alloc] initWithSnapshotDirectory:spentDir];
+        [spending takeSnapshotPassOverDocuments:dirty];
+        CHECK([self indexEntriesAtURL:[spentDir URLByAppendingPathComponent:kIndexFileName]].count == 2,
+              @"the snapshot pass wrote nothing for two dirty buffers");
+        [ud setBool:NO forKey:kSnapshotEnabledKey];
+        CHECK(!spending.snapshotModeInForce && ![spending snapshotDocumentsBeforeQuit:dirty],
+              @"the snapshot preference is off but the quit was still told not to ask about the dirty buffers");
+        [spending applicationWillTerminate];
+        CHECK(![fm fileExistsAtPath:[spentDir URLByAppendingPathComponent:kIndexFileName].path] &&
+              [fm contentsOfDirectoryAtPath:spentDir.path error:NULL].count == 0,
+              @"with snapshot mode off, quitting must still delete this run's snapshots and its index");
+
+        // …but a run that keeps nothing of its own (snapshots off here; -nosession is the same shape) must not
+        // downgrade an *earlier* quit's clean-quit index to a crash on the way past it. Those buffers were kept on
+        // purpose and nothing has answered for them yet, so the launch after this one still has to restore them
+        // silently rather than open with "Notepad++ did not shut down properly".
+        NSURL *throughDir = [box URLByAppendingPathComponent:@"passing-through" isDirectory:YES];
+        NSURL *throughIndex = [throughDir URLByAppendingPathComponent:kIndexFileName];
+        [self writeSnapshotData:probe named:bName inDirectory:throughDir];
+        [self writeIndexEntries:@[@{kSnapshotKey: bName, kNameKey: @"new 1", kModifiedKey: when}]
+                      cleanQuit:YES toURL:throughIndex];
+        NPPBackupManager *passingBy = [[NPPBackupManager alloc] initWithSnapshotDirectory:throughDir];
+        [passingBy applicationWillTerminate];
+        BOOL stillClean = NO;
+        CHECK([self indexEntriesAtURL:throughIndex cleanQuit:&stillClean].count == 1 && stillClean,
+              @"a run that kept no snapshots of its own turned an earlier quit's clean-quit index into a crash: "
+              @"the next launch would claim it did not shut down properly");
+        CHECK([fm fileExistsAtPath:[throughDir URLByAppendingPathComponent:bName].path],
+              @"a run that kept no snapshots of its own deleted an earlier quit's unsaved work");
+
+        NPPPreferences.shared.rememberLastSession = savedRemember;
+        if (savedEnabled) [ud setObject:savedEnabled forKey:kSnapshotEnabledKey];
+        else [ud removeObjectForKey:kSnapshotEnabledKey];
+    }
+
 #undef CHECK
     [fm removeItemAtURL:box error:NULL];
     return fails;
 }
+
+@end
+
+@implementation NPPBackupCheckContext
+
+- (instancetype)init { if ((self = [super init])) _docs = [NSMutableArray array]; return self; }
+- (NPPDocument *)contextCurrentDocument { return _docs.lastObject; }
+- (NSArray<NPPDocument *> *)contextOpenDocuments { return [_docs copy]; }
+- (NSWindow *)contextWindow { NSWindow *none = nil; return none; }   // no window: see the note on the interface
+
+- (NPPDocument *)contextOpenFileURL:(NSURL *)url {
+    for (NPPDocument *d in _docs) if ([d.fileURL.path isEqualToString:url.path]) return d;   // as a real tab does
+    NPPDocument *doc = [[NPPDocument alloc] initWithContentsOfURL:url error:NULL];
+    if (doc) [_docs addObject:doc];
+    return doc;
+}
+
+- (NPPDocument *)newDocument {
+    NPPDocument *doc = [[NPPDocument alloc] initUntitled];
+    [_docs addObject:doc];
+    return doc;
+}
+
+- (void)contextRevealFileURL:(NSURL *)url line:(NSInteger)line {}
+- (void)contextSelectDocument:(NPPDocument *)doc {}
+- (void)contextTogglePanel:(id<NPPPanel>)panel {}
+- (void)contextShowPanel:(id<NPPPanel>)panel {}
+- (BOOL)contextPanelIsVisible:(id<NPPPanel>)panel { return NO; }
+- (void)contextRefreshUI {}
+- (void)contextReportStatus:(NSString *)message isError:(BOOL)isError {}
 
 @end

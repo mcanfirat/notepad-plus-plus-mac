@@ -59,8 +59,9 @@ Other targets: `make exercise` (headless GUI sweep: validates all 648 menu items
 watchdog so a modal that blocks fails instead of hanging), `make screenshot` (writes two images of the main window with no Screen Recording permission:
 `build/screenshot.png` through the print path, which re-runs every `drawRect:`, and `build/screenshot-onscreen.png`,
 the real composited pixels — only the second one shows a view painting over its siblings), `make dmg`.
-The app also honours `--selftest` and the `NPP_EXERCISE=1`, `NPP_EXERCISE_DIALOGS=1` and `NPP_SCREENSHOT=/path/out.png`
-debug hooks.
+The app also honours `--selftest` and the `NPP_EXERCISE=1`, `NPP_EXERCISE_DIALOGS=1`, `NPP_SCREENSHOT=/path/out.png`,
+`NPP_TYPETEST=1` (real key events through the responder chain) and `NPP_QUITTEST=type|check` (quit through
+`-[NSApp terminate:]`, relaunch, and report what unsaved work came back) debug hooks.
 
 ## Features
 
