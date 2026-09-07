@@ -1,0 +1,36 @@
+Notepad++ for macOS
+===================
+
+This project is a macOS port of Notepad++ and is therefore a derivative work of
+it. It is distributed under the GNU General Public License version 3 or later —
+see LICENSE.
+
+Notepad++
+  Copyright (C) Don HO <don.h@free.fr> and contributors
+  https://github.com/notepad-plus-plus/notepad-plus-plus
+  GPL-3.0-or-later
+
+  This port reuses Notepad++'s data files verbatim at build time — langs.model.xml,
+  stylers.model.xml, the 23 themes, the functionList parser rules, the API files for
+  auto-completion, the user-defined language samples and the 94 nativeLang
+  translations — and ports the logic of its language/lexer wiring and its editor,
+  search and encoding commands. None of Notepad++'s Win32 UI code is used.
+
+Scintilla
+  Copyright 1998-2021 by Neil Hodgson <neilh@scintilla.org>
+  https://www.scintilla.org/
+  Built from the copy in the Notepad++ tree, using its official Cocoa backend.
+  Licensed under the Scintilla licence (a permissive HISTORIC PERMISSION NOTICE).
+
+Lexilla
+  Copyright 1998-2021 by Neil Hodgson <neilh@scintilla.org>
+  https://www.scintilla.org/Lexilla.html
+  Built from the copy in the Notepad++ tree, including Notepad++'s own LexUser,
+  LexObjC and LexSearchResult. Same licence as Scintilla.
+
+uchardet
+  Copyright (C) 2011 Mozilla Foundation and contributors
+  Built from the copy in the Notepad++ tree. Licensed under the MPL 1.1 / GPL 2.0 /
+  LGPL 2.1 tri-licence.
+
+The application icon is converted from Notepad++'s own npp.ico.

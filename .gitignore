@@ -1,0 +1,10 @@
+# Build output
+build/
+dist/
+*.log
+
+# macOS
+.DS_Store
+
+# The Notepad++ checkout this project builds against lives outside the repo
+# (../notepad-plus-plus by default, or $NPP). It is never vendored here.

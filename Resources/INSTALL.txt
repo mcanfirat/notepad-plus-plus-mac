@@ -1,0 +1,28 @@
+Notepad++ for macOS — kurulum / installation
+============================================
+
+TÜRKÇE
+------
+1. Notepad++.app dosyasını yandaki "Applications" klasörüne sürükleyin.
+2. Terminal'i açın ve şu tek satırı yapıştırıp Enter'a basın:
+
+       xattr -dr com.apple.quarantine /Applications/Notepad++.app
+
+3. Uygulamayı Launchpad'den veya Uygulamalar klasöründen açın.
+
+2. adım neden gerekli: bu uygulama Apple Developer ID ile imzalanmadığı için
+macOS indirilen kopyayı karantinaya alır ve "zarar görmüş / açılamıyor" diyerek
+başlatmayı reddeder. Yukarıdaki komut sadece o karantina etiketini siler.
+
+ENGLISH
+-------
+1. Drag Notepad++.app onto the "Applications" folder next to it.
+2. Open Terminal and paste this single line, then press Enter:
+
+       xattr -dr com.apple.quarantine /Applications/Notepad++.app
+
+3. Launch it from Launchpad or the Applications folder.
+
+Why step 2 is needed: the app is ad-hoc signed (no Apple Developer ID), so
+macOS quarantines the downloaded copy and refuses to start it ("is damaged and
+can't be opened"). The command above only removes that quarantine flag.

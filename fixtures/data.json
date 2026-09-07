@@ -1,0 +1,7 @@
+{
+  "name": "Notepad++",
+  "version": "8.9.8",
+  "platforms": ["windows", "macos"],
+  "features": { "tabs": true, "lexers": 142, "themes": 23 },
+  "nested": { "deep": { "value": null } }
+}
